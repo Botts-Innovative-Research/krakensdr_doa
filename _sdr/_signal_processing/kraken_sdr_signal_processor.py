@@ -99,7 +99,7 @@ class SignalProcessor(threading.Thread):
 
         self.module_receiver = module_receiver
         self.data_que = data_que
-        self.en_spectrum = False
+        self.en_spectrum = True
         self.en_record = False
         self.wav_record_path = f"{shared_path}/records/fm"
         self.en_iq_files = False
