@@ -1,14 +1,19 @@
 """
-KrakenSDR WebSocket broadcast server.
+KrakenSDR WebSocket broadcast server — zero external dependencies.
 
-Runs in its own background daemon thread with a dedicated asyncio event loop,
-completely independent of the dash_devices / Quart server on port 8080.
-This means clients can connect and receive data immediately at application
+Implements the WebSocket protocol (RFC 6455) directly on top of Python's
+asyncio TCP server, so it works with whatever Python 3.x is installed on the
+KrakenSDR device without requiring Quart, hypercorn, websockets, or any other
+third-party package.
+
+The server runs in its own background daemon thread with a dedicated asyncio
+event loop, completely independent of the dash_devices / Quart server on
+port 8080.  Clients can connect and receive data immediately at application
 startup — no browser needs to be open.
 
-Endpoint
---------
-    ws://<host>:<WS_PORT>/ws/kraken          (default port 8082)
+Endpoint (default)
+------------------
+    ws://<host>:8082/ws/kraken
 
 Every message is a JSON object whose first key is 'type':
 
@@ -16,24 +21,23 @@ Every message is a JSON object whose first key is 'type':
     { "type": "spectrum", "timestamp": <epoch_ms>, ... }
     { "type": "settings", "timestamp": <epoch_ms>, ... }
 
-On connect the client immediately receives the last-known settings snapshot
-so it always has the current device configuration without waiting for a change.
+On connect the client immediately receives the last-known settings snapshot.
 
 Thread-safety
 -------------
 Signal-processor and fetch_dsp_data timer threads call broadcast_from_thread()
-which is a non-blocking, thread-safe fire-and-forget that schedules the
-async send onto the WS server's own event loop.
+which is a non-blocking fire-and-forget that schedules the async send onto the
+WS server's own event loop via asyncio.run_coroutine_threadsafe().
 """
 
 import asyncio
+import base64
+import hashlib
 import json
 import logging
+import struct
 import threading
 from typing import Optional
-
-from quart import Quart
-from quart import websocket as ws_ctx
 
 logger = logging.getLogger(__name__)
 
@@ -42,37 +46,132 @@ logger = logging.getLogger(__name__)
 # One asyncio.Queue per connected client.
 _ws_clients: set = set()
 
-# The event loop running inside the WS server thread.  Set by start_server()
-# before the serve loop begins; None until then.
+# The event loop running inside the WS server thread.
 _event_loop: Optional[asyncio.AbstractEventLoop] = None
 
 # Last settings payload as a serialised JSON string.  Written synchronously by
 # cache_settings() so it is available even before the server starts.
 _last_settings: Optional[str] = None
 
-# ── internal Quart app ────────────────────────────────────────────────────────
-
-_ws_app = Quart(__name__)
-_ws_app.logger.setLevel(logging.WARNING)
+# RFC 6455 magic GUID used to compute Sec-WebSocket-Accept
+_WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 
-@_ws_app.websocket("/ws/kraken")
-async def _ws_kraken():
+# ── WebSocket protocol helpers ────────────────────────────────────────────────
+
+async def _do_handshake(reader: asyncio.StreamReader,
+                        writer: asyncio.StreamWriter) -> bool:
+    """Read the HTTP upgrade request and respond with 101."""
+    headers: dict = {}
+    try:
+        await reader.readline()  # request line — discard
+        while True:
+            raw = await reader.readline()
+            line = raw.decode(errors="replace").strip()
+            if not line:
+                break
+            if ": " in line:
+                k, v = line.split(": ", 1)
+                headers[k.lower()] = v
+    except Exception:
+        return False
+
+    ws_key = headers.get("sec-websocket-key", "")
+    if not ws_key:
+        return False
+
+    accept = base64.b64encode(
+        hashlib.sha1((ws_key + _WS_GUID).encode()).digest()
+    ).decode()
+
+    writer.write(
+        b"HTTP/1.1 101 Switching Protocols\r\n"
+        b"Upgrade: websocket\r\n"
+        b"Connection: Upgrade\r\n"
+        + f"Sec-WebSocket-Accept: {accept}\r\n\r\n".encode()
+    )
+    await writer.drain()
+    return True
+
+
+async def _send_text(writer: asyncio.StreamWriter, text: str) -> None:
+    """Send a single WebSocket text frame (opcode 0x1, FIN set)."""
+    payload = text.encode("utf-8")
+    length = len(payload)
+    if length <= 125:
+        header = bytes([0x81, length])
+    elif length <= 65535:
+        header = bytes([0x81, 126]) + struct.pack(">H", length)
+    else:
+        header = bytes([0x81, 127]) + struct.pack(">Q", length)
+    writer.write(header + payload)
+    await writer.drain()
+
+
+async def _drain_incoming(reader: asyncio.StreamReader) -> None:
+    """Read and discard all frames sent by the client.
+
+    Clients rarely send anything, but we must drain the TCP receive buffer to
+    prevent back-pressure from stalling the connection.  Also detects a clean
+    close frame (opcode 0x8).
+    """
+    try:
+        while True:
+            header = await reader.readexactly(2)
+            masked_len = header[1]
+            is_masked = bool(masked_len & 0x80)
+            length = masked_len & 0x7F
+            if length == 126:
+                length = struct.unpack(">H", await reader.readexactly(2))[0]
+            elif length == 127:
+                length = struct.unpack(">Q", await reader.readexactly(8))[0]
+            if is_masked:
+                await reader.readexactly(4)   # mask key — discard
+            if length:
+                await reader.readexactly(length)  # payload — discard
+            opcode = header[0] & 0x0F
+            if opcode == 0x8:  # close frame
+                break
+    except Exception:
+        pass
+
+
+# ── client handler ────────────────────────────────────────────────────────────
+
+async def _handle_client(reader: asyncio.StreamReader,
+                         writer: asyncio.StreamWriter) -> None:
+    if not await _do_handshake(reader, writer):
+        writer.close()
+        return
+
     q: asyncio.Queue = asyncio.Queue(maxsize=20)
     _ws_clients.add(q)
     logger.info("WS client connected (%d total)", len(_ws_clients))
-    try:
-        # Send cached settings snapshot immediately so the client has current
-        # device configuration without waiting for a settings-change event.
+
+    async def _send_loop() -> None:
         if _last_settings is not None:
-            await ws_ctx.send(_last_settings)
+            await _send_text(writer, _last_settings)
         while True:
             message = await q.get()
-            await ws_ctx.send(message)
-    except Exception:
-        pass
+            await _send_text(writer, message)
+
+    send_task = asyncio.ensure_future(_send_loop())
+    recv_task = asyncio.ensure_future(_drain_incoming(reader))
+
+    try:
+        done, pending = await asyncio.wait(
+            {send_task, recv_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for t in pending:
+            t.cancel()
     finally:
         _ws_clients.discard(q)
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            pass
         logger.info("WS client disconnected (%d total)", len(_ws_clients))
 
 
@@ -81,7 +180,7 @@ async def _ws_kraken():
 def cache_settings(payload: dict) -> None:
     """Synchronously cache the settings payload.
 
-    Called by save_configuration() *before* broadcast_from_thread() so the
+    Called by save_configuration() before broadcast_from_thread() so the
     snapshot is always current — even at startup before the event loop exists.
     """
     global _last_settings
@@ -89,10 +188,7 @@ def cache_settings(payload: dict) -> None:
 
 
 async def broadcast_to_ws(payload: dict) -> None:
-    """Coroutine: put a JSON message on every connected client's queue.
-
-    Uses put_nowait() so a slow client never blocks the pipeline.
-    """
+    """Put a JSON message on every connected client's queue (non-blocking)."""
     message = json.dumps(payload)
     slow_clients: set = set()
     for q in list(_ws_clients):
@@ -106,12 +202,7 @@ async def broadcast_to_ws(payload: dict) -> None:
 
 
 def broadcast_from_thread(payload: dict) -> None:
-    """Thread-safe, non-blocking broadcast.
-
-    Safe to call from any worker thread (signal processor, Timer callbacks).
-    Schedules broadcast_to_ws onto the WS server's event loop and returns
-    immediately.
-    """
+    """Thread-safe, non-blocking broadcast from any worker thread."""
     loop = _event_loop
     if loop is None or loop.is_closed():
         return
@@ -124,30 +215,26 @@ def broadcast_from_thread(payload: dict) -> None:
 def start_server(host: str = "0.0.0.0", port: int = 8082) -> None:
     """Start the WebSocket server in a background daemon thread.
 
-    Uses hypercorn (Quart's bundled ASGI server) with a fresh asyncio event
-    loop, entirely separate from the dash_devices server on port 8080.
-    Returns immediately; the server runs until the process exits.
+    Uses only Python stdlib — no Quart, hypercorn, or websockets package
+    required.  Returns immediately; the server runs until the process exits.
     """
-    from hypercorn.asyncio import serve
-    from hypercorn.config import Config
-
     def _run() -> None:
         global _event_loop
-
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         _event_loop = loop
 
-        config = Config()
-        config.bind = [f"{host}:{port}"]
-        config.loglevel = "WARNING"
+        async def _serve() -> None:
+            server = await asyncio.start_server(_handle_client, host, port)
+            logger.info(
+                "KrakenSDR WebSocket server listening on ws://%s:%d/ws/kraken",
+                host, port,
+            )
+            async with server:
+                await server.serve_forever()
 
-        logger.info(
-            "KrakenSDR WebSocket server listening on ws://%s:%d/ws/kraken",
-            host, port,
-        )
         try:
-            loop.run_until_complete(serve(_ws_app, config))
+            loop.run_until_complete(_serve())
         except Exception:
             logger.exception("WebSocket server stopped unexpectedly")
 
@@ -156,5 +243,5 @@ def start_server(host: str = "0.0.0.0", port: int = 8082) -> None:
 
 
 def register_ws_route(_quart_app) -> None:
-    """No-op — kept so existing call sites don't break during transition."""
+    """No-op — kept so any stale call sites don't raise AttributeError."""
     pass
