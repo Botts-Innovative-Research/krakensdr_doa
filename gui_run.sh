@@ -49,6 +49,7 @@ python3 _ui/_web_interface/app.py >"${SHARED_FOLDER_DOA_LOGS}/ui.log" 2>&1 &
 echo "Data Out Server Running at $IPADDR:$IPPORT"
 # $SERVER_BIN "${SHARED_FOLDER}" 2> server.log &
 # $SERVER_BIN "${SHARED_FOLDER}" 2>/dev/null &
+$SERVER_BIN "${SHARED_FOLDER}" >/miniserve_error.log 2>&1  &
 
 # Start nodejs server for KrakenSDR Pro App
 #node _nodejs/index.js 1>/dev/null 2>/dev/null &
