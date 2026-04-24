@@ -34,6 +34,10 @@ app.layout = main.layout
 # It is workaround for splitting callbacks in separate files (run callbacks after layout)
 from callbacks import display_page, main, update_daq_params  # noqa: F401
 
+# Register the WebInterface as the handler for inbound WS commands so that
+# external clients can update settings via ws://host:8082/ws/kraken.
+kraken_ws_server.register_command_handler(web_interface.handle_ws_command)
+
 # Start the standalone WebSocket server immediately — pure stdlib, no Quart or
 # hypercorn required, completely independent of the dash_devices server.
 kraken_ws_server.start_server(host="0.0.0.0", port=8082)

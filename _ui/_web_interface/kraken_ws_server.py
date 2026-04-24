@@ -37,7 +37,7 @@ import json
 import logging
 import struct
 import threading
-from typing import Optional
+from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +52,10 @@ _event_loop: Optional[asyncio.AbstractEventLoop] = None
 # Last settings payload as a serialised JSON string.  Written synchronously by
 # cache_settings() so it is available even before the server starts.
 _last_settings: Optional[str] = None
+
+# Optional callback invoked with a parsed dict whenever a client sends a
+# JSON command frame.  Register via register_command_handler().
+_command_handler: Optional[Callable[[dict], None]] = None
 
 # RFC 6455 magic GUID used to compute Sec-WebSocket-Accept
 _WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
@@ -108,30 +112,49 @@ async def _send_text(writer: asyncio.StreamWriter, text: str) -> None:
     await writer.drain()
 
 
-async def _drain_incoming(reader: asyncio.StreamReader) -> None:
-    """Read and discard all frames sent by the client.
+async def _receive_and_dispatch(reader: asyncio.StreamReader) -> None:
+    """Read frames sent by the client, unmask them, and dispatch commands.
 
-    Clients rarely send anything, but we must drain the TCP receive buffer to
-    prevent back-pressure from stalling the connection.  Also detects a clean
-    close frame (opcode 0x8).
+    Client→server frames are always masked (RFC 6455 §5.3).  Text frames
+    (opcode 0x1) are decoded as UTF-8 JSON and forwarded to the registered
+    command handler.  All other frame types are consumed silently so TCP
+    back-pressure never stalls the connection.  A close frame (opcode 0x8)
+    terminates the loop.
     """
     try:
         while True:
             header = await reader.readexactly(2)
+            opcode = header[0] & 0x0F
             masked_len = header[1]
             is_masked = bool(masked_len & 0x80)
             length = masked_len & 0x7F
+
             if length == 126:
                 length = struct.unpack(">H", await reader.readexactly(2))[0]
             elif length == 127:
                 length = struct.unpack(">Q", await reader.readexactly(8))[0]
+
+            mask_key = b""
             if is_masked:
-                await reader.readexactly(4)   # mask key — discard
+                mask_key = await reader.readexactly(4)
+
+            payload = b""
             if length:
-                await reader.readexactly(length)  # payload — discard
-            opcode = header[0] & 0x0F
+                payload = await reader.readexactly(length)
+
+            # Unmask payload (XOR each byte with cycling mask key)
+            if is_masked and mask_key:
+                payload = bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
+
             if opcode == 0x8:  # close frame
                 break
+            elif opcode == 0x1 and _command_handler is not None:  # text frame
+                try:
+                    data = json.loads(payload.decode("utf-8"))
+                    loop = asyncio.get_event_loop()
+                    await loop.run_in_executor(None, _command_handler, data)
+                except Exception as exc:
+                    logger.warning("WS command error: %s", exc)
     except Exception:
         pass
 
@@ -156,7 +179,7 @@ async def _handle_client(reader: asyncio.StreamReader,
             await _send_text(writer, message)
 
     send_task = asyncio.ensure_future(_send_loop())
-    recv_task = asyncio.ensure_future(_drain_incoming(reader))
+    recv_task = asyncio.ensure_future(_receive_and_dispatch(reader))
 
     try:
         done, pending = await asyncio.wait(
@@ -176,6 +199,17 @@ async def _handle_client(reader: asyncio.StreamReader,
 
 
 # ── public API ────────────────────────────────────────────────────────────────
+
+def register_command_handler(fn: Callable[[dict], None]) -> None:
+    """Register a callable that receives parsed JSON dicts from WS clients.
+
+    Called once at startup (from app.py or headless.py) to wire inbound
+    commands to the WebInterface.  The callable is invoked in a thread-pool
+    executor so it may safely perform blocking I/O.
+    """
+    global _command_handler
+    _command_handler = fn
+
 
 def cache_settings(payload: dict) -> None:
     """Synchronously cache the settings payload.
