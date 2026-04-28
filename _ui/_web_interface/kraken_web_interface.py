@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import queue
 import time
 
@@ -17,12 +18,13 @@ from variables import (
 
 # isort: on
 
+import variables
 from dash_devices.dependencies import Input
 from kraken_sdr_receiver import ReceiverRTLSDR
 
 # Import built-in modules
 from kraken_sdr_signal_processor import SignalProcessor
-from utils import read_config_file_dict, settings_change_watcher
+from utils import apply_settings_dict, read_config_file_dict, settings_change_watcher
 
 
 class WebInterface:
@@ -467,6 +469,65 @@ class WebInterface:
 
     def close(self):
         pass
+
+    def handle_ws_command(self, payload: dict):
+        """Process an inbound WebSocket command from an external client.
+
+        Expected format::
+
+            {
+                "type": "command",
+                "action": "update_settings",
+                "data": { <partial or full settings dict> }
+            }
+
+        The incoming ``data`` dict is merged over the current settings so
+        callers only need to send the keys they want to change.  Settings are
+        applied immediately to the signal processor (no 0.5 s poll delay) and
+        ``needs_refresh`` is set so the GUI form fields update on the next
+        Dash timer tick.
+        """
+        if payload.get("type") != "command":
+            return
+
+        action = payload.get("action")
+
+        if action == "update_settings":
+            incoming = payload.get("data", {})
+            if not incoming:
+                return
+
+            # Load current settings as the base so a partial update works.
+            try:
+                with open(settings_file_path, "r", encoding="utf-8") as f:
+                    current = json.load(f)
+            except Exception:
+                current = {}
+
+            merged = {**current, **incoming}
+            merged["ext_upd_flag"] = False
+
+            # Persist to disk.
+            with open(settings_file_path, "w", encoding="utf-8") as f:
+                json.dump(merged, f, indent=2)
+
+            # Advance the known-timestamp so the file watcher doesn't
+            # re-apply the same settings 0.5 s later.
+            new_mtime = os.path.getmtime(settings_file_path)
+            variables.dsp_settings = merged
+            variables.dsp_settings["timestamp"] = new_mtime
+
+            # Apply immediately — no waiting for the file-change poll.
+            apply_settings_dict(self, merged)
+
+            # Signal the Dash refresh timer to push all form fields to the GUI.
+            self.needs_refresh = True
+
+            # Broadcast the full updated settings to all WS subscribers.
+            self.save_configuration()
+            self.logger.info("Settings updated via WebSocket command")
+        else:
+            self.logger.warning("Unknown WS command action: %s", action)
 
     def config_daq_rf(self, f0, gain):
         """
